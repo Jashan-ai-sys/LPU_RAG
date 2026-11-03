@@ -235,7 +235,7 @@ flowchart TD
   D -- unchanged --> Z[skip]
   D -- new or changed --> E[Chunk ~400 tokens, 60 overlap<br/>headings and paragraphs first]
   D -- missing from source --> X[Delete points by doc_id<br/>manifest: deleted]
-  E --> F["Contextualise (optional): Nova Micro, 50–100 tokens per chunk,<br/>document in a cached prompt block"]
+  E --> F["Contextualise (optional): Nova Micro, 50–100 tokens per chunk<br/>whole document cached once, chunks read it from cache (§5.1)"]
   F --> G["Embed 'title: … | text: context + chunk', batches of 64"]
   F --> H[BM25 sparse vector of context + chunk]
   G --> I[Upsert batches of 256<br/>point id = uuid5 of chunk_hash + model + context version]
@@ -258,10 +258,42 @@ flowchart TD
 - `--workers` caps Bedrock concurrency below the account's Nova Micro quota.
 - `--bulk` sets the collection's `indexing_threshold` to 0 during upload so HNSW is built once at the end, then restores it and waits for green. The HNSW build time is reported separately.
 
-**Contextual retrieval.**
-- Uses Anthropic's published prompt (document, then chunk, then "a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval").
-- The document sits in a cached prompt block, so later chunks of the same document mostly pay cache-read tokens ($0.01025 per 1M for Nova Micro in Mumbai).
-- The context is stored in the payload and indexed by both BM25 and the embedding.
+### 5.1 Contextual retrieval, with each document cached once
+
+At ingestion, every chunk gets a 50–100 token context written by Nova Micro. It uses Anthropic's published prompt: the whole document, then the chunk, then "a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval". The context is stored in the payload and indexed by **both** BM25 and the embedding.
+
+**Cost control: the whole document is a cached prompt prefix.**
+- Without caching, a document with *N* chunks would be sent, and its prefill computed, *N* times.
+- With Bedrock prompt caching, the request is laid out as:
+  1. instructions + **full document text**;
+  2. a `cachePoint`;
+  3. the chunk (the only part that changes).
+- The first chunk's call writes the document to Bedrock's cache. Every later chunk of the same document **reads it from cache instead of re-running prefill on it**.
+- Cached tokens are billed at the cache-read rate: **$0.01025 per 1M** for Nova Micro in Mumbai, versus $0.041 uncached, so **75% cheaper**. Responses come back faster too.
+- What it does *not* do:
+  - Cached reads are not free.
+  - The first call per document pays full input price. The Price List has no separate Nova write rate, so writes are assumed to bill at the normal input price; this is checked against `cacheWriteInputTokens` on the first run.
+  - The output tokens (the context itself) are always paid.
+- None of this runs on our EC2 CPU. LLM prefill happens on Bedrock. Our CPU only runs EmbeddingGemma 2, which embeds each chunk once and has no prefill to cache.
+
+**Worked example** (Nova Micro, Mumbai): a 5,000-token document cut into 12 chunks of ~400 tokens, with ~100 tokens of instructions and ~80 output tokens per chunk.
+
+| | Input billed | Cost per document |
+|---|---|---|
+| No cache | 12 × 5,500 = 66,000 tokens at $0.041/M | ≈ $0.00271 + output $0.00016 = **$0.00287** |
+| Document cached | 1 × 5,500 at $0.041/M, plus 11 × (5,000 cache-read at $0.01025/M + 500 at $0.041/M) | ≈ $0.00101 + output $0.00016 = **$0.00117** (−59%) |
+
+The saving grows with document length and chunk count. For the 100K-passage NQ experiment, a passage's parent article is the cached block.
+
+**Rules that make the cache hit:**
+- **Order:** all chunks of one document are processed back to back. One call primes the cache, then the remaining chunks run (in parallel up to the worker limit) within the **5-minute cache TTL**, which resets on each hit. Documents are interleaved only *between* documents, never mid-document.
+- **Byte-identical prefix:** the document text and instructions are frozen per `context_version`, so the prefix is the same for every chunk. Anything that changes per call (chunk text, index) goes **after** the `cachePoint`.
+- **Size limits:**
+  - Nova caches a prefix of **at least 1K tokens** and up to **~20K tokens**.
+  - Shorter documents simply aren't cached (they're cheap anyway).
+  - Longer documents are split into sections of ≤ 18K tokens on headings. Each chunk is contextualised with its enclosing section plus a one-paragraph document summary, generated once per document and cached with the section.
+- **On-demand only:** Bedrock prompt caching isn't available with batch inference, so the contextualiser uses on-demand Converse calls with `--workers` concurrency.
+- **Verified, not assumed:** every response's `usage` (`cacheReadInputTokens`, `cacheWriteInputTokens`, `inputTokens`, `outputTokens`) is logged per document. The run report shows the cache-hit ratio and the actual cost, and a unit test checks that the `cachePoint` sits after the document and before the chunk.
 
 ## 6. Index design (Qdrant)
 
@@ -477,12 +509,12 @@ Plus: passages indexed, wall-clock, passages/s, peak RAM, index size, cost per 1
 | NAT Gateway (on demand) | $0.056/h + $0.056/GB (+ its IPv4 while on) | ~8 h, ~15 GB of pulls | ~$1.3 |
 | Client VPN association | $0.15/h | ~80 h (on demand, off nightly) | ~$12.0 |
 | Client VPN connections | $0.05/h per user | e.g. 3 people × 25 h | ~$3.8 |
-| Bedrock Nova Micro | $0.041 in / $0.164 out per 1M; cache read $0.01025 | contextual 100K pilot + LPU docs | ~$5–8 |
+| Bedrock Nova Micro | $0.041 in / $0.164 out per 1M; cache read $0.01025 | contextual 100K pilot + LPU docs, with document caching (§5.1) | ~$3–6 |
 | Bedrock Nova Lite | $0.071 in / $0.284 out per 1M | ~$0.0003 per answer | < $1 |
 | CloudWatch Logs ingest + storage | $0.67/GB ingested, $0.03/GB-month; first 5 GB/month free | ~3–6 GB incl. VPC Flow Logs | $0–1 |
 | CloudWatch alarms, metrics, dashboard | $0.10/alarm, $0.30/metric; 10 alarms, 10 metrics, 3 dashboards free | 9 alarms, ~8 metrics, 1 dashboard | $0 |
 | Lambda, Scheduler, SNS email, ACM imports | free tier | | $0 |
-| **Total** | | | **~$57–62** |
+| **Total** | | | **~$55–60** |
 
 **Cost risks, in order:**
 1. **Client VPN left attached:** $110/month. The nightly detach caps this at roughly 12 h × 30 days ≈ $54/month even if someone forgets `vpn-down` every day.
@@ -500,7 +532,7 @@ Plus: passages indexed, wall-clock, passages/s, peak RAM, index size, cost per 1
 
 | Level | What | How |
 |---|---|---|
-| Unit | Chunker; `point_id` stability; manifest diff; RRF query JSON (k=60); prompt-cache request shape; retry/backoff; ranx wrapper vs hand-computed fixtures; API-token hashing and auth; `users.yaml` validation (unique usernames, valid keys, roles) | pytest + pytest-django, botocore `Stubber` |
+| Unit | Chunker; `point_id` stability; manifest diff; RRF query JSON (k=60); prompt-cache request shape (`cachePoint` after the document, before the chunk; prefix byte-identical across a document's chunks); retry/backoff; ranx wrapper vs hand-computed fixtures; API-token hashing and auth; `users.yaml` validation (unique usernames, valid keys, roles) | pytest + pytest-django, botocore `Stubber` |
 | Integration | Qdrant in Docker: upsert, unchanged re-run = 0 writes, changed doc replaces only its points, deleted doc removed; hybrid query returns BM25-only and dense-only hits | GitHub Actions service container |
 | Contract | embedder `/embed`: shapes, unit norm, query vs document prompt, refuses float16 | pytest against the container |
 | Provisioning | `team.py sync` is idempotent (twice = no change); `remove` disables the Warpgate user and Django user; a `dev` user sees no `prod-admin` target; `rag-dev` can't sudo except `rag-logs` | Against a Warpgate container and a throwaway AL2023 container in CI |
@@ -540,6 +572,7 @@ Plus: passages indexed, wall-clock, passages/s, peak RAM, index size, cost per 1
 - Qdrant sparse vectors, IDF modifier: https://qdrant.tech/documentation/concepts/vectors/#sparse-vectors
 - Qdrant quantization: https://qdrant.tech/documentation/guides/quantization/
 - Anthropic, Introducing Contextual Retrieval: https://www.anthropic.com/news/contextual-retrieval
+- Amazon Bedrock prompt caching (Nova limits, TTL, Converse `cachePoint`): https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html
 - BEIR: https://github.com/beir-cellar/beir
 - AWS Client VPN, mutual authentication: https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/mutual.html
 - AWS Client VPN, client certificate revocation lists: https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/cvpn-working-certificates.html
