@@ -24,7 +24,48 @@ An intelligent, production-grade Retrieval-Augmented Generation (RAG) chatbot de
 ---
 
 
-## 🏗 System Architecture
+## 🧭 v2 Architecture (AWS design)
+
+The next version is designed as a production-style AWS deployment with a private network, a VPN-only sandbox, and every request recorded. It is a **design**; the running version is v1, described in the next section.
+Full design spec: [`docs/superpowers/specs/2026-11-03-rag-v2-design.md`](docs/superpowers/specs/2026-11-03-rag-v2-design.md)
+
+**Request path**: nginx edge in a public subnet, RAG stack in a private subnet:
+
+![v2 request path](docs/architecture/aws-architecture.png)
+
+**Team access**: AWS Client VPN → Warpgate bastion → prod and sandbox, with CloudWatch and VPC Flow Logs:
+
+![v2 team access and sandbox](docs/architecture/team-access.png)
+
+**Highlights**
+- **Hybrid retrieval:** BM25 sparse + dense vectors in **Qdrant**, fused with Reciprocal Rank Fusion (k = 60).
+- **Self-hosted embeddings:** **EmbeddingGemma 2** (text-only, CPU), so queries never leave the VPC and there is no per-token embedding bill.
+- **Contextual retrieval at ingestion:** Amazon Bedrock **Nova Micro** writes a short context for each chunk.
+  - The **whole document is a cached prompt prefix**, so later chunks read it from cache instead of re-running prefill.
+  - That makes cached input 75% cheaper.
+- **Incremental indexing:**
+  - content-hash IDs, so unchanged re-runs write nothing;
+  - retries with backoff, resumable runs, a delete guard and a per-collection run lock.
+- **Network:**
+  - **Public subnet:** nginx + certbot edge, plus a NAT instance.
+  - **Private subnets:** prod and a **sandbox** that replicates it.
+  - **NAT Gateway:** switched on only to pull images and the model.
+- **Team access:**
+  - **AWS Client VPN** with one certificate per person;
+  - **Warpgate** bastion with per-user logins, recording every SSH session and sandbox HTTP request;
+  - SSH only through VPN → Warpgate.
+- **Observability:** CloudWatch logs, metrics, alarms and a dashboard, plus VPC Flow Logs for every network flow.
+- **Security:**
+  - IMDSv2;
+  - secrets in SSM Parameter Store;
+  - least-privilege IAM, with each host writing only its own logs and Bedrock limited to two models.
+- **Cost-aware:** instances are stopped when idle, the VPN is detached outside work hours, and budget alerts are set.
+
+Editable diagrams: [`docs/architecture/aws-architecture.drawio`](docs/architecture/aws-architecture.drawio) (two pages).
+
+---
+
+## 🏗 System Architecture (v1, current)
 
 ```mermaid
 graph TD
