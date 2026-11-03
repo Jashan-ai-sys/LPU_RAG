@@ -31,10 +31,10 @@ Rebuild the LPU UMS assistant so retrieval is production-grade and backed by mea
 1. The app answers university questions end to end on the new stack, in prod and in the sandbox.
 2. The scale test indexes **≥ 1,000,000 passages** and publishes a results table (§10.5) with every number measured.
 3. Re-running the indexer on unchanged input writes **0 points** (tested).
-4. From the internet, only 80/443 on the edge are reachable. Port 22 and the sandbox are reachable only from VPN clients (tested from outside and from inside the VPN).
-5. Every human action is attributable to one person and replayable: VPN logs by certificate CN; SSH sessions and sandbox HTTP requests recorded by Warpgate under the person's username; sandbox app actions by Django user.
+4. From the internet only the edge's 80/443 answer. From the VPN only `10.0.1.10:2222/8888` (Warpgate) answer. App port 22 and the sandbox's 8000 accept only the edge SG. All of this is tested from outside, from inside the VPN, and from the sandbox.
+5. Every human action is attributable to one person and replayable: VPN logs by certificate CN; SSH sessions and sandbox HTTP requests recorded by Warpgate under the person's username; sandbox app actions by Django user. The one exception is admin break-glass through Session Manager: it's restricted to the admin IAM user, logged to `/rag/ssm-sessions` and attributed in CloudTrail.
 6. CloudWatch holds the app, nginx, Warpgate, VPN and VPC Flow logs; the alarms in §8.2 email on failure.
-7. First-month AWS spend stays **under $60** of the $99.63 Free-plan credits (§11).
+7. First-month AWS spend stays **under $65** of the $99.63 Free-plan credits (itemised in §11; budget alerts at $35/$50/$60).
 
 **Non-goals:** multi-AZ high availability, autoscaling, reranking models, user-facing document upload, Kubernetes, SSO for the VPN.
 
@@ -47,19 +47,19 @@ Rebuild the LPU UMS assistant so retrieval is production-grade and backed by mea
 | D3 | Search engine | **Qdrant**, one collection with a dense and a BM25 sparse vector | 1M × 768-d int8 ≈ 1 GB RAM. OpenSearch's 4 GiB heap guidance alone is half the 8 GiB box. Hybrid and fusion run in one query. |
 | D4 | BM25 | Client-side sparse vectors (FastEmbed `Qdrant/bm25`), collection `modifier: idf` | Server-side BM25 inference is only documented for Qdrant Cloud. |
 | D5 | Fusion | RRF with **k = 60 set explicitly** | Qdrant's default k is 2. |
-| D6 | LLMs | **Amazon Bedrock**: Nova Micro for chunk context and the planner, Nova Lite for answers. APAC inference profiles `apac.amazon.nova-micro-v1:0`, `apac.amazon.nova-lite-v1:0` | Paid from AWS credits, authorised by instance roles (no keys), cheapest listed in Mumbai. |
+| D6 | LLMs | **Amazon Bedrock**: Nova Micro for chunk context and the planner, Nova Lite for answers. APAC inference profiles `apac.amazon.nova-micro-v1:0`, `apac.amazon.nova-lite-v1:0`. The phase-2 test call first tries the in-Region `amazon.nova-micro-v1:0` for the contextualiser, because a single region keeps prompt-cache hits higher. | Paid from AWS credits, authorised by instance roles (no keys), cheapest listed in Mumbai. |
 | D7 | Network | One VPC, `10.0.0.0/16`, one AZ. **Public** `10.0.1.0/24` (edge), **private prod** `10.0.2.0/24`, **private sandbox** `10.0.3.0/24` | Clear trust boundaries. The sandbox shares the VPC by user choice; separate SGs, instances, data and secrets keep it apart. |
 | D8 | Reverse proxy | **nginx** + certbot (Let's Encrypt, HTTP-01) on the edge instance | User's choice; also rate limits and static files. |
-| D9 | Egress | **NAT instance on the edge** by default; a **managed NAT Gateway switched on only for image and model pulls** (Terraform toggle) | A NAT Gateway costs $0.056/h + $0.056/GB in Mumbai, ~$41/month if always on. Pulls need it for a few hours a month. |
+| D9 | Egress | **NAT instance on the edge** by default; a **managed NAT Gateway switched on only for image and model pulls** (Terraform toggle) | A NAT Gateway costs $0.056/h + $0.056/GB plus its IPv4 ($0.005/h) in Mumbai, ~$44.5/month if always on. Pulls need it for a few hours a month. |
 | D10 | Team VPN | **AWS Client VPN, mutual TLS**: one client certificate per person (CN = username) from our own CA; server cert and client CA imported into ACM; revocation via CRL | User's choice; same model as the team's existing work VPN. |
-| D11 | VPN cost control | Endpoint stays; the **subnet association** is attached on demand (`make vpn-up`) and **detached nightly** by EventBridge Scheduler + Lambda | Billing is $0.15/h per association + $0.05/h per connection. Always attached = ~$110/month, more than the credits. |
-| D12 | SSH and internal HTTP | **Warpgate** (Apache-2.0, single Rust binary) on the edge at `10.0.1.10`. VPN clients can reach **only Warpgate** (SSH 2222, HTTPS 8888). App instances accept 22/8000 **only from the edge SG**. Each person has their own Warpgate user; Warpgate reaches targets with its own key as role accounts `rag-admin` / `rag-dev`. | User requirement: per-user names, and every SSH session and sandbox request recorded and replayable. Same pattern as the team's work bastion. Session Manager stays as break-glass for admins. |
+| D11 | VPN cost control | Terraform keeps the endpoint. The **subnet association is not a Terraform resource**: `make vpn-up`/`vpn-down` attach and detach it with the CLI, and a Lambda **detaches it hourly from 21:00 to 08:00 IST** | Billing is $0.15/h per association + $0.05/h per connection. Always attached = ~$110/month, more than the credits. |
+| D12 | SSH and internal HTTP | **Warpgate** (Apache-2.0, single Rust binary) on the edge at `10.0.1.10`. VPN clients can reach **only Warpgate** (SSH 2222, HTTPS 8888). App instances accept 22/8000 **only from the edge SG**. Each person has their own Warpgate user; Warpgate reaches targets with its own key as role accounts `rag-admin` / `rag-dev`. | User requirement: per-user names, and every SSH session and sandbox request recorded and replayable. Same pattern as the team's work bastion. Session Manager stays as **admin break-glass**: limited to the admin IAM user, sessions logged to `/rag/ssm-sessions`. It needs egress through the edge NAT or `make pull-on`. |
 | D13 | Identity source | One file, `team/users.yaml`, drives VPN certificates, Warpgate users/roles and sandbox app users | Add or remove a person in one place. |
-| D18 | Observability | **CloudWatch**: agent on all three hosts (memory, disk, journald), Docker `awslogs` driver, VPC Flow Logs, Client VPN logs, ≤10 alarms → SNS email, one dashboard | Everything recorded in one place, inside the always-free allowances (5 GB logs, 10 alarms, 10 custom metrics, 3 dashboards) at this size. |
 | D14 | Compute | Prod: `m7i-flex.large` (8 GiB). Sandbox: `c7i-flex.large` (4 GiB). Edge: `t3.micro`. Stopped when idle | All Free-plan eligible on this account (checked). |
 | D15 | IaC | **Terraform** in `infra/`, one `app_env` module used twice (prod, sandbox) | The sandbox is the same code with different variables, so it really replicates prod. |
 | D16 | App | Keep **Django + LlamaIndex** and the planner/retriever/generator agents; add per-user API tokens | Reuse what works. |
 | D17 | Scale-test corpus | **BEIR Natural Questions**, 1M-passage subset keeping every judged-relevant passage | CC BY-SA, 3,452 judged queries. MS MARCO is non-commercial research only. |
+| D18 | Observability | **CloudWatch**: agent on all three hosts (memory, disk, journald), Docker `awslogs` driver, VPC Flow Logs, Client VPN logs, 9 alarms → SNS email, one dashboard | Everything recorded in one place, inside the always-free allowances (5 GB logs, 10 alarms, 10 custom metrics, 3 dashboards) at this size. |
 
 ## 3. Architecture: request path (diagram page 1)
 
@@ -92,10 +92,10 @@ flowchart LR
 
 | Component | Image / runtime | Role |
 |---|---|---|
-| Warpgate (edge only) | official Warpgate release (single binary or its Docker image), exact version pinned at build (§14) | SSH 2222 and HTTPS 8888 on `10.0.1.10`; per-user auth, roles, session recording |
+| Warpgate (edge only) | official Warpgate Docker image in the edge Compose file (`deploy/edge/docker-compose.yml`), exact version pinned at build (§14); data in `/var/lib/warpgate` (root-only bind mount) | SSH 2222 and HTTPS 8888 on `10.0.1.10`; per-user auth, roles, session recording |
 | CloudWatch agent (all hosts) | `amazon-cloudwatch-agent` package | journald + host metrics to CloudWatch |
 | nginx (edge only) | `nginx:1.27-alpine` | TLS on 443, 80 → 443, `limit_req` on `/api/`, proxy to prod `10.0.2.x:8000`, ACME challenge path |
-| certbot (edge only) | `certbot/certbot`, systemd timer twice a day | Issues and renews the certificate, reloads nginx |
+| certbot (edge only) | `certbot/certbot` container run by a systemd timer twice a day; shares the ACME webroot and `letsencrypt` volume with nginx | Issues and renews the certificate; a deploy-hook reloads nginx |
 | NAT (edge host) | `iptables MASQUERADE`, `ip_forward=1`, source/dest check off | Default egress for both private subnets |
 | web | this repo's Dockerfile (Python 3.11), gunicorn 2 workers | UI, auth, `/api/chat/`, orchestrator |
 | embedder | new `embedder/` image: FastAPI + sentence-transformers, CPU torch | `POST /embed {texts, kind: query or document, titles?}` → normalized 768-d vectors |
@@ -103,7 +103,15 @@ flowchart LR
 | db | `postgres:16-alpine` | Django tables, chat log, manifest, API tokens |
 | indexer | same image as web, `manage.py index_docs` | One-shot job (Compose profile `jobs`) |
 
-Model weights download once into a named volume (`hf-cache`) while the NAT Gateway is on. After that the app needs no internet for embeddings.
+**Images:**
+- GitHub Actions builds the `web` and `embedder` images on every tag push and pushes them to GHCR (public).
+- Hosts pull them while the NAT Gateway is on.
+- Model weights download once into a named volume (`hf-cache`) in the same window. After that the app needs no internet for embeddings.
+
+**Embedder load (pinned).**
+- Loaded with `SentenceTransformer("google/embeddinggemma-2", revision=<commit sha>, model_kwargs={"torch_dtype": torch.float32}, config_kwargs=<text-only settings from the model card>)`.
+- Documents are formatted by hand as `title: {title} | text: {content}` (`title: none` when there's no title), because `prompt_name="Document"` always sends `title: none`. Queries use `prompt_name="SearchQuery"`.
+- Contract tests check that the loaded model has about 270M parameters, and that a titled document embeds differently from `title: none`.
 
 ### 3.2 Request flow
 
@@ -169,7 +177,7 @@ users:
 |---|---|---|---|
 | `prod-admin` | SSH `10.0.2.x:22` | `rag-admin` (sudo, docker) | prod `admin` |
 | `prod-dev` | SSH `10.0.2.x:22` | `rag-dev` (shell + `sudo /usr/local/bin/rag-logs`, read-only `docker compose logs`) | prod `admin`, `dev` |
-| `sandbox` | SSH `10.0.3.x:22` | `rag-dev` with docker. Root-equivalent on the sandbox, which is acceptable because it holds no prod data | sandbox `admin`, `dev` |
+| `sandbox` | SSH `10.0.3.x:22` | `rag-dev` **with docker** (variable `rag_dev_docker = true` only in the sandbox). Root-equivalent there, which is acceptable because it holds no prod data and its IAM role can't write prod or edge logs (§8.1) | sandbox `admin`, `dev` |
 | `sandbox-web` | HTTP `http://10.0.3.x:8000` | the browser session, proxied | sandbox `admin`, `dev` |
 
 **Usage:** `ssh -p 2222 jashan:prod-dev@10.0.1.10` for SSH; `https://10.0.1.10:8888` for the sandbox app and session replays.
@@ -177,19 +185,21 @@ users:
 | Access | Mechanism | How it's managed |
 |---|---|---|
 | VPN | Client cert with `CN=<username>`, signed by our CA (easy-rsa). The CA private key lives **offline** on the admin's laptop, encrypted, never on AWS. | `team.py vpn-issue <user>` writes `<user>-rag.ovpn` (endpoint config + that user's cert/key), handed over privately. `team.py vpn-revoke <user>` adds the cert to the CRL and imports it into the endpoint. |
-| Warpgate | One user per person, with their SSH public key, plus a password with **TOTP required** for the web UI. Roles as in the table above. | `team.py sync` calls the Warpgate admin API (OpenAPI) over the VPN; the admin web UI is the fallback. |
+| Warpgate | One user per person, with their SSH public key, plus a password with **TOTP required** for the web UI. The credential policy is set per user (`http: [Password, Totp]`, `ssh: [PublicKey]`), so a password-only web login and a password SSH login are both refused. Roles as in the table above. | `team.py sync` calls the Warpgate admin API (OpenAPI) over the VPN; the admin web UI is the fallback. |
 | Servers | Only two **role accounts**, `rag-admin` and `rag-dev`. Each accepts **only Warpgate's public key** and is created at boot by user-data. No personal Linux accounts, no passwords, no root login. | Terraform user-data |
-| Sandbox app + API | A Django user per person, with a random first password (must change on first login). Per-user API tokens are stored as SHA-256 hashes and shown once. `/api/chat/` accepts `Authorization: Bearer <token>`. | `manage.py team_sync`, run in the sandbox by `team.py sync` through Warpgate |
+| Sandbox app + API | A Django user per person. A random first password is delivered once; the user changes it on Django's password-change page. Per-user API tokens are stored as SHA-256 hashes and shown once. `/api/chat/` accepts `Authorization: Bearer <token>`. Scripts first authenticate to Warpgate (a Warpgate ticket for the `sandbox-web` target), then send the Django token. | `manage.py team_sync`, run in the sandbox by `team.py sync` through Warpgate |
 | Removal | `team.py remove <user>`: revoke the VPN cert, disable the Warpgate user, deactivate the Django user, revoke tokens. Recordings are kept. | one command |
 
 **What Warpgate records.**
 - Every SSH session: full terminal output, replayable in the admin UI.
 - Every HTTP request through `sandbox-web`.
-- Each recording is tied to the Warpgate username, target, source IP and time.
+- Each recording is tied to the Warpgate username, target, time, and source IP. The source IP is a Client VPN ENI address; the identity comes from the Warpgate username.
 
 The session index lives in Warpgate's SQLite database under `/var/lib/warpgate` on the edge's EBS volume. A nightly EBS snapshot (Data Lifecycle Manager) keeps 7 days; recordings older than 90 days are pruned.
 
-**sshd hardening (app instances):** `PasswordAuthentication no`, `PermitRootLogin no`, `AllowUsers rag-admin rag-dev`, `MaxAuthTries 3`; the SG admits 22 only from the edge SG.
+**Hardening (app instances).**
+- sshd: `PasswordAuthentication no`, `PermitRootLogin no`, `AllowUsers rag-admin rag-dev`, `MaxAuthTries 3`. The SG admits 22 only from the edge SG.
+- Instance metadata is blocked for non-root local users (`iptables -A OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j DROP`), so `rag-dev` can't read the instance role's credentials. Docker containers still use IMDSv2 through the daemon.
 
 **Limits of certificate-only Client VPN.**
 - Authorization rules can't tell users apart without SAML or AD.
@@ -204,12 +214,12 @@ The session index lives in Warpgate's SQLite database under `/var/lib/warpgate` 
 | Client CIDR | `10.100.0.0/22` (AWS minimum /22, no overlap with the VPC) |
 | Split tunnel | **On**: only VPC routes use the VPN; everything else stays on the user's own internet |
 | Transport / port | UDP 443 |
-| DNS | VPC resolver `10.0.0.2` |
-| Session timeout | 8 h; client reconnects with the same cert |
+| DNS | **Not set**: clients keep their own resolver. The authorization rule only allows Warpgate, so the VPC resolver would be unreachable. If VPC DNS is ever needed, add a rule for `10.0.0.2/32`. |
+| Session timeout | 8 h; client reconnects with the same cert. **Importing a CRL resets every current session**, so `team.py vpn-revoke` warns that everyone will reconnect. |
 | Authorization rule | Allow only `10.0.1.10/32` (Warpgate) to authenticated clients |
 | Target network | One association, in the public subnet. Its ENIs use security group `vpn`. |
 | Connection logging | CloudWatch log group `/rag/client-vpn` (connect/disconnect, CN, source IP), retention 90 days |
-| Cost guard | EventBridge Scheduler at 21:00 IST runs a Lambda (Python, ~30 lines) that disassociates the target network. `make vpn-up` re-associates (takes ~5–10 min); `make vpn-down` detaches by hand. |
+| Cost guard | **The association is not a Terraform resource.** Terraform owns the endpoint, its SG/VPC binding and the authorization rule, all of which survive disassociation. `make vpn-up` / `make vpn-down` call `associate-` / `disassociate-client-vpn-target-network` (associating takes ~5–10 min). EventBridge Scheduler runs the `vpn_off` Lambda **hourly from 21:00 to 08:00 IST**: it detaches any association, and emails through SNS if a NAT Gateway has existed for more than 6 h. |
 
 ### 4.3 How the sandbox replicates prod
 
@@ -219,11 +229,12 @@ The session index lives in Warpgate's SQLite database under `/var/lib/warpgate` 
   - subnet (`10.0.3.0/24`);
   - SSM path (`/rag/sandbox/*` vs `/rag/prod/*`);
   - Qdrant collection data;
-  - `ALLOWED_HOSTS`;
+  - `ALLOWED_HOSTS` and `CSRF_TRUSTED_ORIGINS`: the sandbox includes `https://10.0.1.10:8888` and the Host header Warpgate forwards;
+  - `rag_dev_docker` (true only in the sandbox);
   - no public route: nginx on the edge does **not** proxy to the sandbox.
 - **Sandbox URL:** the `sandbox-web` target in Warpgate (`https://10.0.1.10:8888`). Requests are recorded per user; there's no direct route to `10.0.3.x:8000` from the VPN.
 - **Data:** the sandbox indexes the same public university documents. It never receives prod chat logs or users.
-- **Promotion:** a change runs in the sandbox first. Prod updates by moving the same git tag (`make deploy ENV=prod TAG=v2.x`).
+- **Promotion:** a change runs in the sandbox first. Prod updates by moving the same tag: `make deploy ENV=prod TAG=v2.x` sends an SSM Run Command (`AWS-RunShellScript`) to the instance tagged `Env=prod`. It checks out the tag and pulls its GHCR images (turn the NAT Gateway on first if the images are new), then runs `docker compose up -d`. The same path works before the VPN exists.
 
 ## 5. Indexing pipeline
 
@@ -244,7 +255,24 @@ flowchart TD
   J --> K[Manifest: indexed, doc_hash, point_ids, versions]
 ```
 
-**Idempotency.** `chunk_hash = sha256(doc_id + chunk_text)` and `point_id = uuid5(NS, f"{embed_model}:{context_version}:{chunk_hash}")`. The indexer asks Qdrant which IDs already exist and skips them, so an unchanged re-run embeds and writes nothing.
+**Idempotency.**
+- `chunk_hash = sha256(doc_id + chunk_text)`.
+- `point_id = uuid5(NS, f"{embed_fp}:{sparse_fp}:{context_version}:{chunk_hash}")`, where:
+  - `embed_fp` = `model@revision:dtype:dim`;
+  - `sparse_fp` = FastEmbed version + BM25 `k`, `b`, `avg_len`.
+- For **contextualised** collections the ID also includes `doc_hash`. Editing a document changes every chunk's context, so unchanged chunk text still gets re-contextualised.
+- The indexer asks Qdrant which IDs already exist and skips them, so an unchanged re-run embeds and writes nothing. When a skipped point's position moved, only its `chunk_idx` payload is updated.
+
+**BEIR loader (scale test).**
+- One passage = one point. The chunker is bypassed.
+- `doc_id` = the BEIR passage `_id`, so the eval runner maps hits to qrels directly.
+- An `article` payload field (the passage title) is used for grouping during contextualisation and for article-level deletes.
+- A test checks that every qrel `_id` in the subset appears exactly once in the collection.
+
+**Delete safety and concurrency.**
+- An empty or failed source listing is fatal.
+- A run refuses to delete more than 10% of indexed documents unless given `--allow-mass-delete`.
+- Each run holds a per-collection Postgres advisory lock (`pg_try_advisory_lock`). A second concurrent run exits immediately.
 
 **Manifest** (Postgres `rag_document`): `doc_id`, `source_uri`, `title`, `doc_hash`, `chunk_count`, `point_ids`, `embed_model`, `context_version`, `status` (`pending`, `indexing`, `indexed`, `failed`, `deleted`), `error`, `updated_at`.
 
@@ -265,9 +293,9 @@ At ingestion, every chunk gets a 50–100 token context written by Nova Micro. I
 **Cost control: the whole document is a cached prompt prefix.**
 - Without caching, a document with *N* chunks would be sent, and its prefill computed, *N* times.
 - With Bedrock prompt caching, the request is laid out as:
-  1. instructions + **full document text**;
+  1. a fixed preamble + the **full document text** (the cached prefix);
   2. a `cachePoint`;
-  3. the chunk (the only part that changes).
+  3. the chunk + the instruction, the only part that changes per call. This keeps Anthropic's prompt order: document, chunk, instruction.
 - The first chunk's call writes the document to Bedrock's cache. Every later chunk of the same document **reads it from cache instead of re-running prefill on it**.
 - Cached tokens are billed at the cache-read rate: **$0.01025 per 1M** for Nova Micro in Mumbai, versus $0.041 uncached, so **75% cheaper**. Responses come back faster too.
 - What it does *not* do:
@@ -283,10 +311,13 @@ At ingestion, every chunk gets a 50–100 token context written by Nova Micro. I
 | No cache | 12 × 5,500 = 66,000 tokens at $0.041/M | ≈ $0.00271 + output $0.00016 = **$0.00287** |
 | Document cached | 1 × 5,500 at $0.041/M, plus 11 × (5,000 cache-read at $0.01025/M + 500 at $0.041/M) | ≈ $0.00101 + output $0.00016 = **$0.00117** (−59%) |
 
-The saving grows with document length and chunk count. For the 100K-passage NQ experiment, a passage's parent article is the cached block.
+The example assumes every later chunk is a cache hit, which is the best case; real runs report the measured hit ratio.
+
+The saving grows with document length and chunk count. For the 100K-passage NQ experiment, the cached block is a **fixed window of consecutive passages from the same article** (≤ 18K tokens). An article is the set of passages sharing a `title`, joined in numeric `_id` order.
 
 **Rules that make the cache hit:**
-- **Order:** all chunks of one document are processed back to back. One call primes the cache, then the remaining chunks run (in parallel up to the worker limit) within the **5-minute cache TTL**, which resets on each hit. Documents are interleaved only *between* documents, never mid-document.
+- **Order:** all chunks of one document are processed back to back. One call primes the cache, and the remaining chunks are sent **only after the priming call's response has started** (in parallel up to the worker limit), within the **5-minute cache TTL**, which resets on each hit. Documents are interleaved only *between* documents, never mid-document.
+- **Region:** an APAC cross-region profile can route calls to different regions, which turns would-be reads into writes. The phase-2 test decides whether the in-Region model is available. Either way the hit ratio is measured, not assumed.
 - **Byte-identical prefix:** the document text and instructions are frozen per `context_version`, so the prefix is the same for every chunk. Anything that changes per call (chunk text, index) goes **after** the `cachePoint`.
 - **Size limits:**
   - Nova caches a prefix of **at least 1K tokens** and up to **~20K tokens**.
@@ -294,6 +325,7 @@ The saving grows with document length and chunk count. For the 100K-passage NQ e
   - Longer documents are split into sections of ≤ 18K tokens on headings. Each chunk is contextualised with its enclosing section plus a one-paragraph document summary, generated once per document and cached with the section.
 - **On-demand only:** Bedrock prompt caching isn't available with batch inference, so the contextualiser uses on-demand Converse calls with `--workers` concurrency.
 - **Verified, not assumed:** every response's `usage` (`cacheReadInputTokens`, `cacheWriteInputTokens`, `inputTokens`, `outputTokens`) is logged per document. The run report shows the cache-hit ratio and the actual cost, and a unit test checks that the `cachePoint` sits after the document and before the chunk.
+- **Pilot gate:** the 1K-passage pilot reports the measured hit ratio and $/passage. The 100K run starts only if the projected cost is **≤ $8**; the upper bound is the no-cache cost.
 
 ## 6. Index design (Qdrant)
 
@@ -302,18 +334,19 @@ Collections: `lpu_docs` (app), `nq_1m` (scale test), `nq_100k_ctx` (contextual e
 | Setting | Value | Reason |
 |---|---|---|
 | dense `dense` | 768, cosine | Native EmbeddingGemma 2 output |
-| quantization | scalar int8, `always_ram: true`, quantile 0.99 | ~0.77 GB for 1M vectors |
-| originals | `on_disk: true` | ~3.1 GB float32 at 1M stays on EBS |
+| quantization | scalar int8, quantile 0.99, kept **in RAM** (Qdrant ≥ 1.20: memory tier `pinned`; 1.19: `always_ram: true`) | ~0.77 GB for 1M vectors |
+| originals | **on disk** (≥ 1.20: tier `cold`; 1.19: `on_disk: true`) | ~3.1 GB float32 at 1M stays on EBS |
 | HNSW | `m: 16`, `ef_construct: 100`, graph in RAM | ~0.15 GB at 1M |
 | search | `hnsw_ef: 128`; rescoring off by default, measured both ways | gp3's 3,000 IOPS can hurt p95 when rescoring reads from disk |
-| sparse `bm25` | `modifier: idf`, index in RAM | BM25 |
+| sparse `bm25` | `modifier: idf`, index in RAM. FastEmbed `Bm25` gets `avg_len` computed per collection from its tokenised corpus; `k`, `b` and `avg_len` are recorded in the results JSON and in `sparse_fp`. Queries use `query_embed`. | BM25 |
 | payload | `doc_id`, `title`, `source_uri`, `chunk_idx`, `text`, `context`, `chunk_hash`; keyword index on `doc_id` | Deletes and filters |
-| inline storage | **off**; every storage tier set explicitly | Qdrant 1.20 changed tier defaults; RSS checked with `docker stats` |
+| inline storage | **off**; every tier set explicitly as above, and asserted by the schema unit test | Qdrant 1.20 changed tier defaults; RSS checked with `docker stats` |
 
 ```json
 {
   "prefetch": [
-    {"query": [/* 768-d */], "using": "dense", "limit": 50},
+    {"query": [/* 768-d */], "using": "dense", "limit": 50,
+     "params": {"hnsw_ef": 128, "quantization": {"rescore": false}}},
     {"query": {"indices": [...], "values": [...]}, "using": "bm25", "limit": 50}
   ],
   "query": {"rrf": {"k": 60}},
@@ -321,6 +354,9 @@ Collections: `lpu_docs` (app), `nq_1m` (scale test), `nq_100k_ctx` (contextual e
   "with_payload": ["doc_id", "title", "text", "context", "source_uri"]
 }
 ```
+
+- Arm C-r uses `"quantization": {"rescore": true, "oversampling": 2.0}`.
+- The eval runner asks for `limit: 100`; production keeps 8.
 
 **RAM at 1M passages on the 8 GiB prod box:**
 
@@ -364,30 +400,34 @@ These add five top-level folders. Each is a separate deployable or tool, so keep
 
 ## 8. Infrastructure (Terraform, `infra/`)
 
+### 8.1 Resources
+
 | Resource | Settings |
 |---|---|
 | VPC | `10.0.0.0/16`, DNS hostnames on, Internet Gateway |
 | Subnets (all `ap-south-1a`) | public `10.0.1.0/24` (route `0.0.0.0/0 → IGW`); private prod `10.0.2.0/24`; private sandbox `10.0.3.0/24`. Private routes: `0.0.0.0/0 → edge ENI`, or → NAT Gateway when `nat_gateway_enabled = true` |
-| NAT Gateway | `count = var.nat_gateway_enabled ? 1 : 0`, its own EIP. `make pull-on` / `make pull-off` flip the variable and apply. |
-| Edge EC2 | `t3.micro`, AL2023, fixed private IP `10.0.1.10`, `credit_specification = standard`, `source_dest_check = false`, EIP, **20 GB** gp3 encrypted (Warpgate recordings), 1 GB swap file, IMDSv2 required. Runs nginx, certbot, Warpgate, NAT and the CloudWatch agent. |
+| NAT Gateway | `count = var.nat_gateway_enabled ? 1 : 0`, its own EIP. `make pull-on` / `make pull-off` flip the variable and apply with `-target` on the NAT Gateway, its EIP and the private route tables only. |
+| Edge EC2 | `t3.micro`, AL2023, fixed private IP `10.0.1.10`, `credit_specification = standard`, `source_dest_check = false`, EIP, **20 GB** gp3 encrypted (Warpgate recordings), 1 GB swap file, IMDSv2 required. Docker + Compose installed. nginx, certbot and Warpgate run in the edge Compose file; NAT and the CloudWatch agent run on the host. |
 | Prod app EC2 | `m7i-flex.large`, AL2023, 50 GB gp3 encrypted, IMDSv2, no public IP, tag `Env=prod` |
 | Sandbox app EC2 | `c7i-flex.large`, AL2023, 30 GB gp3 encrypted, IMDSv2, no public IP, tag `Env=sandbox` |
-| SG `edge` | in: 80/443 from `0.0.0.0/0`; **2222 and 8888 from SG `vpn` only** (Warpgate); all from SGs `prod`, `sandbox` (NAT). No port 22. out: all |
+| SG `edge` | in: 80/443 from `0.0.0.0/0`; **2222 and 8888 from SG `vpn` only** (Warpgate); **TCP 80/443 from SGs `prod`, `sandbox`** (NAT; DNS and NTP use VPC link-local services and never pass through NAT). No port 22. out: all |
 | SG `prod` | in: 8000 and 22 from SG `edge` only (nginx, Warpgate). out: 443 and 80 |
 | SG `sandbox` | in: 22 and 8000 from SG `edge` only (Warpgate). out: 443 and 80 |
 | SG `vpn` | Attached to the Client VPN ENIs; out to `10.0.1.10` on 2222/8888 only |
 | Client VPN | §4.2; server cert + client CA ARNs from ACM, imported by `team.py ca-init` |
-| Scheduler + Lambda | `vpn_off` (Python 3.12, 128 MB), role limited to `ec2:DescribeClientVpnTargetNetworks` and `ec2:DisassociateClientVpnTargetNetwork` on this endpoint |
-| IAM roles | All three: a copy of `AmazonSSMManagedInstanceCore` **without** the parameter actions, plus `CloudWatchAgentServerPolicy`. Edge also reads `/rag/edge/*` (Warpgate admin secret). prod and sandbox read only their own `/rag/<env>/*`, plus `bedrock:InvokeModel`/`Converse*` on the two Nova profiles and their model ARNs. |
-| SSM parameters | `/rag/<env>/django-secret-key`, `db-password`, `qdrant-api-key`, `domain`, `admin-email` (SecureString). **Values set by hand with the CLI, never in Terraform state.** |
+| Scheduler + Lambda | `vpn_off` (Python 3.12, 128 MB), hourly 21:00–08:00 IST. Role statements: `ec2:DescribeClientVpnTargetNetworks` and `ec2:DescribeNatGateways` on `*`; `ec2:DisassociateClientVpnTargetNetwork` on this endpoint's ARN; `sns:Publish` on the alerts topic; plus `AWSLambdaBasicExecutionRole`. |
+| IAM roles | **All three:** a copy of `AmazonSSMManagedInstanceCore` **without** the parameter actions, plus a **scoped CloudWatch policy** instead of `CloudWatchAgentServerPolicy`. It allows `logs:CreateLogStream`, `PutLogEvents` and `DescribeLogStreams` only on that host's own log groups, `cloudwatch:PutMetricData` only with `cloudwatch:namespace = RAG/<host>`, and `ec2:DescribeTags`/`DescribeVolumes`. There is no `CreateLogGroup` or `PutRetentionPolicy`; Terraform creates the groups and sets retention. **Edge** also reads `/rag/edge/*`. **prod and sandbox** read only their own `/rag/<env>/*`, plus `bedrock:InvokeModel` (and `InvokeModelWithResponseStream` only if streaming is added) on the two `apac.amazon.nova-{micro,lite}-v1:0` inference-profile ARNs, and on `arn:aws:bedrock:*::foundation-model/amazon.nova-{micro,lite}-v1:0` with a `bedrock:InferenceProfileArn` condition. **Admin IAM user** (laptop): the only principal with `ssm:StartSession` and `ssm:SendCommand` (`AWS-RunShellScript`, instances tagged `Env=prod/sandbox/edge`). |
+| Session Manager | Preferences document `SSM-SessionManagerRunShell` streams every session to `/rag/ssm-sessions`; Run As is disabled |
+| SSM parameters | `/rag/<env>/django-secret-key`, `db-password`, `qdrant-api-key`, `admin-email`; `/rag/edge/domain`, `/rag/edge/admin-email`, `/rag/edge/warpgate-admin-password` (SecureString). **Values set by hand with the CLI, never in Terraform state.** |
 | CloudWatch | See §8.2 |
 | VPC Flow Logs | All traffic (accept + reject), whole VPC → log group `/rag/vpc-flow`, 30-day retention; IAM role for delivery |
 | Data Lifecycle Manager | Daily snapshot of the edge volume (Warpgate recordings), keep 7 |
-| AWS Budgets | Monthly cost budget **excluding credits**: alerts at $20, $40 and $60, plus one on Client VPN usage type alone at $15 |
+| AWS Budgets | Monthly cost budget **excluding credits**: actual alerts at $35, $50 and $60, plus a forecast alert at $60. A **cumulative** budget (custom period from account creation) alerts at $70 and $85, so the Paid-plan decision comes before the credits run out. A Client VPN budget on the `ClientVPN-EndpointHours` + `ClientVPN-ConnectionHours` usage types at $18. A NAT budget on `NatGateway-Hours` + `NatGateway-Bytes` at $3. |
 
 **Boot (user-data, no secrets inside).**
-- **App:** install Docker + Compose plugin, clone the repo at a pinned tag, fetch `/rag/<env>/*` into `/opt/rag/.env` (root, 0600), install the sshd hardening and the `rag-logs` helper, then `docker compose up -d`.
-- **Edge:** enable ip_forward + MASQUERADE persistently, then start nginx and Warpgate (`warpgate.yaml` from the repo; the admin password comes from SSM) and the CloudWatch agent. certbot issues the first certificate once DNS points at the EIP. Warpgate's own HTTPS on 8888 uses a self-signed certificate; it's only reachable over the VPN, and the fingerprint goes into the team runbook.
+- **App:** install Docker + Compose plugin, clone the repo at a pinned tag, fetch `/rag/<env>/*` into `/opt/rag/.env` (root, 0600), install the sshd hardening, the IMDS block for non-root users and the `rag-logs` helper, create `rag-admin`/`rag-dev` (docker group for `rag-dev` only if `rag_dev_docker`), pull the tag's GHCR images, then `docker compose up -d`.
+- **Edge:** install Docker + Compose, enable ip_forward + MASQUERADE persistently, start the CloudWatch agent, then `docker compose up -d` for nginx and Warpgate (`warpgate.yaml` from the repo; the admin password comes from SSM).
+  - **TLS bootstrap:** nginx starts with an HTTP-only server block that serves the ACME challenge. certbot issues the certificate once DNS points at the EIP, then the 443 block is enabled and nginx reloads. Warpgate's own HTTPS on 8888 uses a self-signed certificate; it's only reachable over the VPN, and the fingerprint goes into the team runbook.
 
 **Domain.** Let's Encrypt needs a hostname pointing at the EIP: a subdomain the user owns, or `<eip-dashed>.sslip.io` (§14).
 
@@ -401,17 +441,18 @@ These add five top-level folders. Each is a separate deployable or tool, so keep
 | Every network flow in the VPC | VPC Flow Logs (accept + reject, all ENIs) | `/rag/vpc-flow` | 30 d |
 | App requests, errors, Bedrock usage per call (model, tokens, latency, user; no prompt text) | Docker `awslogs` driver per container | `/rag/<env>/app`, `/rag/<env>/embedder`, `/rag/<env>/qdrant` | 30 d |
 | Host logs | journald (sshd, docker, cloud-init) via the CloudWatch agent | `/rag/<host>/system` | 30 d |
-| Host metrics | CloudWatch agent: `mem_used_percent`, `disk_used_percent`, swap | metrics, namespace `RAG` (6–8 custom metrics) | 15 months |
+| Host metrics | CloudWatch agent: `mem_used_percent`, `disk_used_percent` (root volume) on each of the 3 hosts | 6 custom metrics in namespaces `RAG/prod`, `RAG/sandbox`, `RAG/edge` (+ 2 from log metric filters = 8, within the free 10) | 15 months |
+| Admin break-glass sessions | Session Manager session logs | `/rag/ssm-sessions` | 90 d |
 | AWS API calls | CloudTrail **event history** (free, 90 days, no trail) | console / `lookup-events` | 90 d |
 
-**Alarms (≤ 10, SNS email):**
-1. Status-check failure on each of the three instances; the edge auto-recovers.
-2. Prod memory > 90% for 10 min.
-3. Disk > 85% (prod, edge).
-4. nginx 5xx > 5% for 5 min (metric filter).
-5. Warpgate failed logins ≥ 10 in 5 min (metric filter).
-6. A NAT Gateway still exists after 6 h (`BytesOutToDestination` present).
-7. Client VPN `ActiveConnectionsCount` > 0 after 22:00 IST.
+**Alarms (9, within the free 10, SNS email):**
+- 1–3: status-check failure on prod, sandbox and edge; the edge auto-recovers.
+- 4–5: memory > 90% for 10 min on prod and on edge.
+- 6–7: disk > 85% on prod and on edge (Warpgate recordings).
+- 8: nginx 5xx > 5% for 5 min (metric filter).
+- 9: Warpgate failed logins ≥ 10 in 5 min (metric filter).
+
+There is no CloudWatch alarm for a forgotten NAT Gateway or VPN association. The hourly `vpn_off` Lambda handles both (§4.2), backed by the NAT and Client VPN budgets (§8.1).
 
 **Dashboard `rag-overview`:** request rate and p95 latency (from app logs), 5xx, CPU/memory/disk per host, VPN connections, Warpgate sessions, Bedrock tokens per day.
 
@@ -430,11 +471,17 @@ These add five top-level folders. Each is a separate deployable or tool, so keep
   - Only Warpgate on the edge can reach port 22 and the sandbox app.
   - VPN users can reach only Warpgate.
   - Every session is tied to a named Warpgate user with an SSH key or a TOTP-protected password, and recorded.
-  - Root login and passwords are off on the app instances.
+  - Root login and passwords are off on the app instances. Non-root users can't reach instance metadata.
+- **Audit integrity:** each role can write only to its own log groups and metric namespace, and can't change retention. The sandbox can't forge or shorten prod, edge or VPN logs.
 - **VPN:**
   - Per-person certificates; the CA key is kept offline.
-  - Revocation through the CRL takes effect on the next connection attempt. Reconnects are re-checked, and session timeout is 8 h.
+  - Revoking a person imports a new CRL, which **ends every current VPN session**; the revoked cert can't reconnect.
+  - The CRL has an expiry (`EASYRSA_CRL_DAYS=180`). The runbook has a dated reminder to re-sign and re-import it before then; an expired CRL blocks all connections.
   - Connection logs show who connected by CN.
+- **Edge is a single point of failure** for the public site, NAT egress and the bastion. That's an accepted risk at this budget.
+  - **Break-glass when the edge is down:** the edge itself is reachable through Session Manager over its EIP. For an app host, run `make pull-on` (the NAT Gateway restores egress to the SSM endpoints), then use Session Manager.
+  - Session Manager sessions are logged and limited to the admin IAM user.
+  - Warpgate's data and keys live in a root-only path on the edge. No container gets the Docker socket.
 - **Prod vs sandbox:** separate SGs, instances, volumes, SSM paths and IAM roles. The prod role can't read sandbox parameters and vice versa. Nginx never routes public traffic to the sandbox.
 - **Secrets:**
   - SSM SecureString, pulled at boot into root-only files.
@@ -453,7 +500,11 @@ These add five top-level folders. Each is a separate deployable or tool, so keep
 
 ### 10.1 Corpus
 - BEIR NQ (2,681,468 passages; 3,452 test queries; 4,201 qrels), downloaded to `bench/data/` (gitignored).
-- **Subset:** every passage of every article containing a judged-relevant passage, then random whole articles (seed 42) up to 1,000,000.
+- **Article** = the passages sharing a `title`, in numeric `_id` order.
+- **Subset:**
+  - every passage of every article containing a judged-relevant passage, then random whole articles (seed 42) up to 1,000,000.
+  - Count the relevant-article passages first. If they exceed 70% of the budget, sample a seeded subset of queries, keep their articles, and fill.
+  - Report the number of queries used and commit the query list.
 - Only method comparisons on this subset are valid, and the README says so.
 - Commit only scripts, the seed, sampled IDs and metrics.
 
@@ -472,18 +523,27 @@ These add five top-level folders. Each is a separate deployable or tool, so keep
 - Run a priced 1K-passage pilot first.
 
 ### 10.3 Metrics
-- **Quality:** Recall@10, Recall@20, nDCG@10, MRR@10 with `ranx` (pinned); paired randomization test (10,000 permutations), p-values and 95% CIs.
-- **Latency:** warm-up, then all 3,452 queries at concurrency 1, 4 and 16. Report p50/p95/p99 for embed, search, total.
+- **Quality:**
+  - **nDCG@10 is the primary metric**; Recall@10/20 and MRR@10 are secondary. Computed with `ranx` (pinned).
+  - The comparison pairs are fixed in advance (C vs A, C vs B, C vs C-r, context vs no-context). Paired randomization test (10,000 permutations) with Holm correction.
+  - 95% CIs come from a seeded paired bootstrap over per-query scores, and the per-query scores are committed.
+- **Latency:**
+  - The retrieval client runs on the prod box in its own container and calls the embedder and Qdrant over the Compose network. Client CPU and steal are recorded.
+  - Preconditions: collection green, indexer stopped.
+  - Warm-up, then all 3,452 queries at concurrency 1, 4 and 16. Report p50/p95/p99 for `sparse_encode`, `embed`, `qdrant` and total, plus error counts.
+  - C-r runs both warm and cold (`drop_caches` first).
+  - A separate end-to-end pass goes from the edge through nginx/gunicorn.
 - **Indexing:** passages/s per stage, HNSW build time, wall-clock.
 - **Resources:** peak RSS per container (`docker stats` every 5 s), Qdrant disk size, CPU and CPU steal (flex instances may throttle under long CPU-bound runs).
 - **Cost per 1M passages:** instance-hours × price + gp3 + IPv4 for the run, plus Bedrock tokens actually billed (from Converse usage fields).
 
 ### 10.4 Embedding throughput gate
-- Google publishes no CPU throughput for EmbeddingGemma 2, so first measure 10K NQ passages on the prod instance, float32 and bf16.
+- Google publishes no CPU throughput for EmbeddingGemma 2, so first time the **full pipeline** (sparse + embed + upsert) on a seeded random 10K NQ sample, with the stack running, in float32 and bf16.
+- Add an estimated HNSW build time to the projection.
 - If 1M would take **> 36 h**, stop and choose with the user:
-  - (a) bulk-embed on the user's Mac and upload vectors, stated in the results;
-  - (b) 512-d Matryoshka (smaller index, same encode cost);
-  - (c) report a measured 500K plus the scaling curve.
+  - (a) bulk-embed on the user's Mac and upload the vectors, stated in the results. The Mac vectors must pass the D2 parity check against the server's;
+  - (b) report a measured 500K plus the scaling curve.
+- (512-d Matryoshka is a memory option, not a speed-up, so it isn't a gate option.)
 - Resume claims follow what was actually done.
 
 ### 10.5 Results table (only from `bench/results/*.json`)
@@ -509,22 +569,23 @@ Plus: passages indexed, wall-clock, passages/s, peak RAM, index size, cost per 1
 | NAT Gateway (on demand) | $0.056/h + $0.056/GB (+ its IPv4 while on) | ~8 h, ~15 GB of pulls | ~$1.3 |
 | Client VPN association | $0.15/h | ~80 h (on demand, off nightly) | ~$12.0 |
 | Client VPN connections | $0.05/h per user | e.g. 3 people × 25 h | ~$3.8 |
-| Bedrock Nova Micro | $0.041 in / $0.164 out per 1M; cache read $0.01025 | contextual 100K pilot + LPU docs, with document caching (§5.1) | ~$3–6 |
+| Client VPN ENI public IPv4 | $0.005/h per ENI while associated | ~80 h × ENI count (read with `describe-network-interfaces` after the first association) | ~$0.4–0.8 |
+| Bedrock Nova Micro | $0.041 in / $0.164 out per 1M; cache read $0.01025 | 1K pilot, then the 100K run if projected ≤ $8 (§5.1). Estimate: N × (window_tokens × hit × 0.01025 + window_tokens × (1 − hit) × 0.041 + ~500 × 0.041 + 80 × 0.164) / 1e6, with window size and hit ratio from the pilot. LPU docs < $0.5 | ≤ ~$8.5 |
 | Bedrock Nova Lite | $0.071 in / $0.284 out per 1M | ~$0.0003 per answer | < $1 |
 | CloudWatch Logs ingest + storage | $0.67/GB ingested, $0.03/GB-month; first 5 GB/month free | ~3–6 GB incl. VPC Flow Logs | $0–1 |
-| CloudWatch alarms, metrics, dashboard | $0.10/alarm, $0.30/metric; 10 alarms, 10 metrics, 3 dashboards free | 9 alarms, ~8 metrics, 1 dashboard | $0 |
+| CloudWatch alarms, metrics, dashboard | $0.10/alarm, $0.30/metric; 10 alarms, 10 metrics, 3 dashboards free | 9 alarms, 8 metrics (6 host + 2 metric filters), 1 dashboard | $0 |
 | Lambda, Scheduler, SNS email, ACM imports | free tier | | $0 |
-| **Total** | | | **~$55–60** |
+| **Total** | 11.3 + 6.8 + 2.2 + 9.1 + 0.5 + 3.7 + 1.3 + 12.0 + 3.8 + 0.8 + ≤ 8.5 + < 1 + ≤ 1 | | **≈ $53–62** |
 
 **Cost risks, in order:**
-1. **Client VPN left attached:** $110/month. The nightly detach caps this at roughly 12 h × 30 days ≈ $54/month even if someone forgets `vpn-down` every day.
+1. **Client VPN left attached:** ~$110/month plus ENI IPv4. The hourly 21:00–08:00 detach limits the worst case to 08:00–21:00 every day: 13 h × 30 × $0.15 ≈ **$58.5/month**, plus connections and ENI IPv4, even if nobody ever runs `vpn-down`.
 2. **Prod app left running 24×7:** ~$74/month. Default state is stopped; `make up ENV=…` / `make down ENV=…`.
-3. **NAT Gateway left on:** ~$41/month. The Budgets alarm on the NAT usage type catches it.
+3. **NAT Gateway left on:** ~$44.5/month including its IPv4. The `vpn_off` Lambda emails after 6 h, and the $3 NAT budget catches it.
 
-**Credits run out within about two months at this pace.** The Free plan also ends on 8 Mar 2027, and a Free-plan account **closes** when credits or time run out. Keeping the VPN and sandbox for the team past that means **upgrading to the Paid plan** (the remaining credits still apply). That's the user's decision (§14).
+**Credits run out within about two months at this pace.** The Free plan also ends on 8 Mar 2027, and a Free-plan account **closes** when credits or time run out. Keeping the VPN and sandbox for the team past that means **upgrading to the Paid plan** (the remaining credits still apply). That's the user's decision (§14). The cumulative budget alerts at $70 and $85; decide before reaching about $80.
 
 **Not chosen:**
-- ALB (~$18/month) + always-on NAT Gateway (~$41/month), the upgrade path for high availability;
+- ALB (~$18/month) + always-on NAT Gateway (~$44.5/month), the upgrade path for high availability;
 - Gemini embeddings (~$10–21 per 1M passages, billed by Google);
 - a self-hosted OpenVPN (~$0 extra), declined in favour of the managed Client VPN.
 
@@ -532,12 +593,12 @@ Plus: passages indexed, wall-clock, passages/s, peak RAM, index size, cost per 1
 
 | Level | What | How |
 |---|---|---|
-| Unit | Chunker; `point_id` stability; manifest diff; RRF query JSON (k=60); prompt-cache request shape (`cachePoint` after the document, before the chunk; prefix byte-identical across a document's chunks); retry/backoff; ranx wrapper vs hand-computed fixtures; API-token hashing and auth; `users.yaml` validation (unique usernames, valid keys, roles) | pytest + pytest-django, botocore `Stubber` |
-| Integration | Qdrant in Docker: upsert, unchanged re-run = 0 writes, changed doc replaces only its points, deleted doc removed; hybrid query returns BM25-only and dense-only hits | GitHub Actions service container |
-| Contract | embedder `/embed`: shapes, unit norm, query vs document prompt, refuses float16 | pytest against the container |
-| Provisioning | `team.py sync` is idempotent (twice = no change); `remove` disables the Warpgate user and Django user; a `dev` user sees no `prod-admin` target; `rag-dev` can't sudo except `rag-logs` | Against a Warpgate container and a throwaway AL2023 container in CI |
+| Unit | Chunker; `point_id` stability, including that a dtype or model-revision change forces a re-embed and an edited document gives unchanged chunks a new context; manifest diff; RRF query JSON (k=60); prompt-cache request shape (`cachePoint` after the document, before the chunk; prefix byte-identical across a document's chunks); retry/backoff; ranx wrapper vs hand-computed fixtures; API-token hashing and auth; `users.yaml` validation (unique usernames, valid keys, roles) | pytest + pytest-django, botocore `Stubber` |
+| Integration | Qdrant in Docker: upsert; unchanged re-run = 0 writes; changed doc replaces only its points; deleted doc removed; **empty source dir → run fails with 0 deletes**; **a second concurrent run exits**; hybrid query returns BM25-only and dense-only hits; every qrel `_id` of a small BEIR fixture appears exactly once | GitHub Actions service container |
+| Contract | embedder `/embed`: shapes, unit norm, query vs document prompt, refuses float16, ~270M parameters loaded, titled document ≠ `title: none` | pytest against the container |
+| Provisioning | `team.py sync` is idempotent (twice = no change); `remove` disables the Warpgate user and Django user; a `dev` user sees no `prod-admin` target; `rag-dev` can't sudo except `rag-logs`; prod `rag-dev` is not in the docker group and can't get IMDS credentials; Warpgate refuses password-only web login and password SSH | Against a Warpgate container and a throwaway AL2023 container in CI |
 | End to end | Compose up locally; three known questions; REJECT path; generator-failure fallback | smoke script |
-| Infra | `terraform validate` + `plan` in CI. After apply, `scripts/verify-infra.sh` checks that from the internet **443 works, 22 and 8000 time out**, and the sandbox is unreachable. Over the VPN, only `10.0.1.10:2222/8888` answers; `ssh -p 2222 you:prod-dev@10.0.1.10` works and shows up as a recording under your name; direct `10.0.2.x:22` times out; a revoked cert can't connect. Each §8.2 log group receives events, and a forced alarm (e.g. stop the sandbox) emails. Bedrock works from both app instances; a third model is denied. Prod's role can't read `/rag/sandbox/*`. | scripted, results committed |
+| Infra | `terraform validate` + `plan` in CI. After apply, `scripts/verify-infra.sh` checks that from the internet **443 works, 22 and 8000 time out**, and the sandbox is unreachable. From the sandbox, `10.0.1.10:2222/8888` time out. Over the VPN, `dig example.com` still resolves, and only `10.0.1.10:2222/8888` answers; `ssh -p 2222 you:prod-dev@10.0.1.10` works and shows up as a recording under your name; direct `10.0.2.x:22` times out; a revoked cert can't connect. Each §8.2 log group receives events, and a forced alarm (e.g. stop the sandbox) emails. Bedrock works from both app instances; a third model is denied. Prod's role can't read `/rag/sandbox/*`; the sandbox role is denied `PutLogEvents` on `/rag/edge/warpgate`. Invoking `vpn_off` removes the association. An SSM session appears in `/rag/ssm-sessions`. | scripted, results committed |
 
 ## 13. Rollout
 
@@ -545,21 +606,21 @@ Plus: passages indexed, wall-clock, passages/s, peak RAM, index size, cost per 1
 |---|---|---|
 | 0. Repo | Fork done (`Jashan-ai-sys/LPU_RAG`), this spec reviewed | User approves the spec |
 | 1. Local | Embedder, Qdrant schema, indexer, retriever, app changes, token auth, `team.py`; tests green with Compose on a laptop | All tests pass, idempotency proven |
-| 2. Network + edge | `terraform apply` (VPC, subnets, edge, SGs, budgets) | `verify-infra` network checks pass |
-| 3. Prod app | NAT Gateway on → pull images + model → off; Bedrock test calls; LPU docs indexed; HTTPS live | Three known questions answered with sources |
+| 2. Network + edge | **Free-plan capability check first:** create an unassociated Client VPN endpoint and a NAT Gateway, delete both within the hour, and record the result (if refused, decide the Paid plan, §14 Q5). Then `terraform apply`: VPC, subnets, edge, SGs, budgets, log groups, alarms, SNS. Bedrock test calls, including the in-Region Nova Micro check | `verify-infra` non-VPN checks pass |
+| 3. Prod app | NAT Gateway on → pull images + model → off; LPU docs indexed; HTTPS live. Operator access in this phase is Session Manager (logged) | Three known questions answered with sources |
 | 4. VPN + Warpgate + team | `team.py ca-init`, Client VPN, scheduler; Warpgate targets/roles; issue certs; `team.py sync` | Each person connects and opens a recorded session as themselves; revocation test passes |
-| 4b. Observability | CloudWatch agent, log groups, VPC Flow Logs, alarms, dashboard | Every §8.2 source visible; test alarm delivered |
+| 4b. Observability | VPC Flow Logs, dashboard, Logs Insights queries (agent, log groups and alarms came in phases 2–3) | Every §8.2 source visible; test alarm delivered |
 | 5. Sandbox | `app_env` with `env=sandbox`; same tag; per-user app logins and tokens | Same three questions answered in the sandbox over the VPN; unreachable from the internet |
 | 6. Throughput gate | 10K-passage embedding benchmark | Projected 1M ≤ 36 h, or the user picks a §10.4 option |
 | 7. Scale test | 1M index, arms, latency runs, 100K contextual experiment | Results JSON committed; spend tracked against §11 |
-| 8. Wrap-up | README results, diagrams, resume bullet from measured numbers; instances stopped; `nq_1m` deleted; VPN detached | Spend under $60 for the month |
+| 8. Wrap-up | README results, diagrams, resume bullet from measured numbers; instances stopped; `nq_1m` deleted; VPN detached | Spend under $65 for the month |
 
 ## 14. Open questions
 
 1. **University documents:** this AWS account has no S3 buckets or knowledge bases. Where are the original 100+ documents?
 2. **Domain** for the public HTTPS certificate: a subdomain you own, or `sslip.io`?
 3. **Team list:** usernames, SSH public keys and roles (prod: admin/dev/none; sandbox: admin/dev/none) for `team/users.yaml`.
-4. **VPN hours:** is "on demand + nightly off" right, or should the scheduler also turn it on at a fixed time on weekdays?
+4. **VPN hours:** is "on demand + automatic off 21:00–08:00" right, or should the scheduler also turn it on at a fixed time on weekdays?
 5. **Paid plan:** VPN + sandbox for a team will use the credits up in about two months, and the Free plan closes the account at the end. Upgrade before then?
 6. **Warpgate version:** pin the latest stable release at build and confirm its admin API supports user/role management (otherwise `team.py` prints the steps for the admin UI). Recording retention is set to 90 days.
 7. **Qdrant version:** pin the newest patch release at build time (v1.19.2 if 1.20 still has no patch).
