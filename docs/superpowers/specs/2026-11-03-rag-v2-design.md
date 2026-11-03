@@ -567,7 +567,7 @@ Plus: passages indexed, wall-clock, passages/s, peak RAM, index size, cost per 1
 | EBS snapshots (edge, 7 daily) | $0.05/GB-month of changed blocks | a few GB | < $0.5 |
 | Public IPv4 (edge EIP) | $0.005/h | month | ~$3.7 |
 | NAT Gateway (on demand) | $0.056/h + $0.056/GB (+ its IPv4 while on) | ~8 h, ~15 GB of pulls | ~$1.3 |
-| Client VPN association | $0.15/h | ~80 h (on demand, off nightly) | ~$12.0 |
+| Client VPN association | $0.15/h | ~80 h (on demand; auto-off hourly 21:00–08:00) | ~$12.0 |
 | Client VPN connections | $0.05/h per user | e.g. 3 people × 25 h | ~$3.8 |
 | Client VPN ENI public IPv4 | $0.005/h per ENI while associated | ~80 h × ENI count (read with `describe-network-interfaces` after the first association) | ~$0.4–0.8 |
 | Bedrock Nova Micro | $0.041 in / $0.164 out per 1M; cache read $0.01025 | 1K pilot, then the 100K run if projected ≤ $8 (§5.1). Estimate: N × (window_tokens × hit × 0.01025 + window_tokens × (1 − hit) × 0.041 + ~500 × 0.041 + 80 × 0.164) / 1e6, with window size and hit ratio from the pilot. LPU docs < $0.5 | ≤ ~$8.5 |
